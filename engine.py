@@ -5,6 +5,8 @@ Four legs, each scored 0-100 (higher = more attractive to rotate into):
     Momentum    RRG position vs the benchmark (RS-Ratio and RS-Momentum ranks)
     Breadth     % of constituents above 50/200-day averages, highs vs lows
     Earnings    implied index EPS (= price / PE) YoY growth and acceleration
+    Flows       FPI net equity investment by sector (NSDL, fortnightly) as % of holdings,
+                plus the quarterly change in FII + DII ownership of the constituents (Screener)
 
 Developed by Dr. Shantanu Samanta.
 """
@@ -16,8 +18,8 @@ import numpy as np
 import pandas as pd
 
 CONSOLIDATED_SWITCH = pd.Timestamp("2021-04-01")  # NSE moved index PE to consolidated earnings
-LEGS = ["Valuation", "Momentum", "Breadth", "Earnings"]
-DEFAULT_WEIGHTS = {"Valuation": 30, "Momentum": 30, "Breadth": 20, "Earnings": 20}
+LEGS = ["Valuation", "Momentum", "Breadth", "Earnings", "Flows"]
+DEFAULT_WEIGHTS = {"Valuation": 25, "Momentum": 30, "Breadth": 15, "Earnings": 15, "Flows": 15}
 
 
 @dataclass
@@ -30,6 +32,7 @@ class Settings:
     weights: dict = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
     z_cheap: float = -0.75
     z_rich: float = 0.75
+    fpi_periods: int = 6        # fortnights summed for the flow leg (6 = about 3 months)
 
 
 # ============================================================================
@@ -191,6 +194,96 @@ def equal_weight_index(prices: pd.DataFrame, symbols: list[str]) -> pd.Series | 
 
 
 # ============================================================================
+# Flows: FPI (NSDL fortnightly) and FII / DII ownership (Screener, quarterly)
+# ============================================================================
+def norm_key(name: str) -> str:
+    import re
+    return re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+
+def fpi_sector_stats(flows: pd.DataFrame, periods: int = 6) -> pd.DataFrame:
+    """Per NSDL sector: net equity flow over the last `periods` fortnights, as % of the latest holdings (AUC),
+    and acceleration = latest 2 fortnights vs the average fortnight before them (both % of AUC)."""
+    if flows is None or flows.empty:
+        return pd.DataFrame()
+    dates = sorted(flows["date"].unique())[-periods:]
+    f = flows[flows["date"].isin(dates)]
+    piv = f.pivot_table(index="key", columns="date", values="net_cr", aggfunc="sum").reindex(columns=dates).fillna(0)
+    auc = flows[flows["date"] == dates[-1]].set_index("key")["auc_cr"]
+    names = flows.drop_duplicates("key", keep="last").set_index("key")["sector"]
+    out = pd.DataFrame({"sector": names.reindex(piv.index), "net_cr": piv.sum(axis=1), "auc_cr": auc.reindex(piv.index)})
+    out = out[out["auc_cr"] > 0]
+    out["flow_pct"] = out["net_cr"] / out["auc_cr"] * 100
+    recent = piv.iloc[:, -2:].mean(axis=1)
+    before = piv.iloc[:, :-2].mean(axis=1) if piv.shape[1] > 2 else recent * 0
+    out["accel_pct"] = ((recent - before) / out["auc_cr"] * 100).reindex(out.index)
+    out["last_net_cr"] = piv.iloc[:, -1].reindex(out.index)
+    return out
+
+
+def index_fpi(cons: pd.DataFrame | None, stats: pd.DataFrame) -> dict:
+    """Map an index to NSDL sectors through its constituents' NSE industry (same taxonomy as NSDL),
+    weighting each sector by how many constituents fall in it."""
+    out = {"fpi_flow_pct": np.nan, "fpi_accel_pct": np.nan, "fpi_net_cr": np.nan, "fpi_cover": 0.0}
+    if cons is None or cons.empty or stats is None or stats.empty or "Industry" not in cons:
+        return out
+    keys = cons["Industry"].map(norm_key)
+    w = keys[keys.isin(stats.index)].value_counts()
+    if w.empty:
+        return out
+    s = stats.loc[w.index]
+    out["fpi_flow_pct"] = float(np.average(s["flow_pct"], weights=w))
+    out["fpi_accel_pct"] = float(np.average(s["accel_pct"].fillna(0), weights=w))
+    out["fpi_net_cr"] = float(s["net_cr"].sum()) if len(w) == 1 else float(np.average(s["net_cr"], weights=w))
+    out["fpi_cover"] = w.sum() / len(cons)
+    out["fpi_sectors"] = ", ".join(s["sector"].astype(str).head(3))
+    return out
+
+
+def index_ownership(cons: pd.DataFrame | None, own: dict[str, pd.DataFrame]) -> dict:
+    """Market-cap-weighted FII and DII holding % of the constituents, latest quarter and the change
+    over 1 and 4 quarters (percentage points)."""
+    out = {k: np.nan for k in ["fii", "dii", "fii_d1q", "dii_d1q", "fii_d4q", "dii_d4q"]}
+    out["own_cover"] = 0.0
+    if cons is None or cons.empty or not own:
+        return out
+    rows = []
+    for sym in cons["Symbol"]:
+        df = own.get(sym)
+        if df is None or len(df) < 2 or "FII" not in df:
+            continue
+        fii, dii = df["FII"].astype(float), df["DII"].astype(float) if "DII" in df else pd.Series(np.nan, df.index)
+        cap = float(df["mcap_cr"].iloc[-1]) if "mcap_cr" in df and pd.notna(df["mcap_cr"].iloc[-1]) else 1.0
+
+        def d(x, k):
+            return x.iloc[-1] - x.iloc[-1 - k] if len(x) > k else np.nan
+
+        rows.append({"w": cap, "fii": fii.iloc[-1], "dii": dii.iloc[-1], "fii_d1q": d(fii, 1), "dii_d1q": d(dii, 1),
+                     "fii_d4q": d(fii, 4), "dii_d4q": d(dii, 4)})
+    if not rows:
+        return out
+    r = pd.DataFrame(rows)
+    for k in ["fii", "dii", "fii_d1q", "dii_d1q", "fii_d4q", "dii_d4q"]:
+        m = r[k].notna()
+        if m.any():
+            out[k] = float(np.average(r.loc[m, k], weights=r.loc[m, "w"]))
+    out["own_cover"] = len(r) / len(cons)
+    return out
+
+
+def flows_score(df: pd.DataFrame) -> pd.Series:
+    """0-100: FPI flow intensity (half absolute, half rank) blended 70/30 with the 1-quarter change in
+    FII + DII ownership when at least half the constituents have ownership data."""
+    inten = df["fpi_flow_pct"] + 0.5 * df["fpi_accel_pct"].fillna(0)
+    fpi = (0.5 * (50 + 50 * np.tanh(df["fpi_flow_pct"] / 1.5)) + 0.5 * pct_rank(inten)).where(df["fpi_flow_pct"].notna())
+    inst = df["fii_d1q"].fillna(0) + df["dii_d1q"].fillna(0)
+    ok = (df["own_cover"] >= 0.5) & df["fii_d1q"].notna()
+    own = (0.5 * (50 + 50 * np.tanh(inst / 1.0)) + 0.5 * pct_rank(inst.where(ok))).where(ok)
+    both = 0.7 * fpi + 0.3 * own
+    return both.where(fpi.notna() & own.notna(), fpi.where(fpi.notna(), own))
+
+
+# ============================================================================
 # Composite
 # ============================================================================
 def pct_rank(s: pd.Series) -> pd.Series:
@@ -252,7 +345,7 @@ def confidence(row: pd.Series) -> str:
         return "Low"
     spread = float(np.std(legs))
     cov = row.get("coverage", 1.0)
-    if len(legs) == 4 and spread < 18 and cov >= 0.8:
+    if len(legs) >= 4 and spread < 18 and cov >= 0.8:
         return "High"
     if len(legs) >= 3 and spread < 25:
         return "Medium"
@@ -271,6 +364,11 @@ def score_table(rows: pd.DataFrame, st: Settings) -> pd.DataFrame:
     df["Breadth_score"] = df["breadth_score"]
     earn_raw = df["eps_yoy"].clip(-50, 80) + 0.5 * df["eps_accel"].clip(-50, 50)
     df["Earnings_score"] = pct_rank(earn_raw).where(earn_raw.notna())
+    for c, v in {"fpi_flow_pct": np.nan, "fpi_accel_pct": np.nan, "fii_d1q": np.nan, "dii_d1q": np.nan,
+                 "own_cover": 0.0}.items():
+        if c not in df:
+            df[c] = v
+    df["Flows_score"] = flows_score(df)
     w = pd.Series({l: max(0.0, float(st.weights.get(l, 0))) for l in LEGS})
 
     def comp(r):

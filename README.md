@@ -1,6 +1,6 @@
 # 🧭 Sector Rotation Screener
 
-A Streamlit app that scores NSE sectoral, thematic and size indices on four legs and shows where
+A Streamlit app that scores NSE sectoral, thematic and size indices on five legs and shows where
 money may be rotating next, with a drill-down into each sector's strongest stocks.
 
 Developed by **Dr Shantanu Samanta** — Physician · Quantitative Market Analyst & Trading-Systems Developer · Kolkata, India.
@@ -13,6 +13,22 @@ Developed by **Dr Shantanu Samanta** — Physician · Quantitative Market Analys
 | **Momentum** | Yahoo Finance / niftyindices prices | Relative Rotation Graph vs Nifty 50 (or Nifty 500): Leading, Weakening, Lagging, Improving |
 | **Breadth** | Constituents (niftyindices) + Yahoo prices | % of stocks above 50 & 200 DMA, near highs vs lows, 1-month change |
 | **Earnings** | Index price ÷ PE | Implied index EPS growth YoY and whether it is accelerating |
+| **Flows** | NSDL fortnightly FPI data + Screener shareholding | FPI net equity buying by sector (last 6 fortnights, as % of FPI holdings) and the quarterly change in FII + DII ownership of the constituents |
+
+Default weights: Valuation 25, Momentum 30, Breadth 15, Earnings 15, Flows 15 (owner-adjustable).
+
+### Flows tab
+
+- **FPI by sector:** NSDL publishes foreign portfolio investors' net investment by sector every fortnight.
+  The app reads the latest 12 reports (cached a day) and shows net buying per sector, a fortnight-by-
+  fortnight heatmap, and the Flows score per index. NSDL uses the same sector names as NSE's industry
+  classification, so each index is mapped through its constituents' industries — bank indices share the
+  Financial Services figure, and broad indices get a blend.
+- **FII / DII ownership:** market-cap-weighted FII and DII holding % of each index's constituents, with the
+  change over 1 and 4 quarters, from the shareholding table on Screener.in. It needs one Screener page per
+  stock, so it is loaded in the background: by `make_snapshot.py` (~20 minutes the first time, then only
+  stocks older than three weeks) or by the owner's **Update ownership data** button (about 80 stocks per
+  click). Visitors never trigger these downloads. The drill-down shows each stock's FII/DII % and change.
 
 Each sector gets a 0–100 composite, a tier (Overweight / Accumulate / Neutral / Underweight),
 a confidence rating, and an action signal from the RRG quadrant × valuation zone
@@ -35,7 +51,8 @@ sector-rotation/
 ├── engine.py           scoring maths (no network)
 ├── data_sources.py     live fetchers + parsers
 ├── net.py              paced, retried HTTP with per-site cool-down
-├── store.py            disk cache (download once, then top up)
+├── store.py            disk cache (download once, then top up) + warm-start seed
+├── make_snapshot.py    builds data/seed/ on your PC
 ├── sectors.py          index list, Yahoo tickers, niftyindices names
 ├── demo_data.py        synthetic data for the tests only
 ├── tests/test_core.py  offline tests (pytest)
@@ -53,6 +70,31 @@ No API keys are needed.
 2. Go to **share.streamlit.io** → **New app** → pick the repo → main file `app.py` → **Deploy**.
 3. The first load takes about 3 minutes (about 550 stock price series plus 24 PE histories).
    After that the app starts in seconds and only tops up what is due (see below).
+
+### Owner settings (password)
+
+Visitors see only **Benchmark** and **Index groups**. Everything else — PE lookback, Z thresholds,
+RRG lengths, leg weights, breadth toggle, PE CSV upload, **Refresh live data** and the data snapshot —
+sits behind a password in the sidebar's **🔒 Owner** box. Visitors can pull Screener results for up to
+10 stocks at a time; the owner up to 25.
+
+1. Streamlit Cloud → your app → **Settings → Secrets**, paste:
+   `OWNER_PASSWORD = "your-long-password"` → Save. (Locally: copy `.streamlit/secrets.toml.example`
+   to `.streamlit/secrets.toml`; it is git-ignored.)
+2. Unlock in the sidebar. Changes apply to your session only, until you click
+   **Defaults for all visitors → Save these as the default**. That lasts until the app restarts; to make
+   it permanent, download `owner_settings.json` there and upload it to the repo's `data/` folder.
+3. Three wrong passwords lock the box for 2 minutes. Without a password set, the owner box is disabled.
+
+### Warm start after sleep or reboot
+
+Streamlit Cloud sleeps apps that have had no visitors for a while; waking can start with an empty
+cache. If the repo has a snapshot in `data/seed/`, the app starts from it and downloads only the days
+since, instead of everything.
+
+- On your own PC: `python make_snapshot.py` (about 3–5 minutes), then upload the `data/seed` folder to
+  GitHub, replacing the old one. Or, as owner, use **Method & data → Prepare snapshot**.
+- Refresh the snapshot weekly — after 7 days the app does its weekly full Yahoo re-download anyway.
 
 ### If NSE blocks the cloud server
 

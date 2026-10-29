@@ -241,6 +241,25 @@ def _clean_label(text: str) -> str:
     return re.sub(r"\s*\+$", "", t).strip()
 
 
+def parse_shareholding(soup: BeautifulSoup) -> pd.DataFrame | None:
+    """Screener's quarterly shareholding table -> DataFrame(index=quarter, columns=[FII, DII, Promoters])."""
+    sec = soup.find("section", id="shareholding")
+    table = sec.find("table") if sec else None
+    if table is None or table.find("thead") is None:
+        return None
+    hdr = [c.get_text(strip=True) for c in table.find("thead").find_all("th")][1:]
+    rows = {}
+    for tr in table.find("tbody").find_all("tr"):
+        tds = tr.find_all("td")
+        if tds:
+            rows[_clean_label(tds[0].get_text(" ", strip=True))] = [_to_float(td.get_text(strip=True)) for td in tds[1:]]
+    cols = {"FII": rows.get("FIIs"), "DII": rows.get("DIIs"), "Promoters": rows.get("Promoters")}
+    cols = {k: v for k, v in cols.items() if v and len(v) == len(hdr)}
+    if not hdr or "FII" not in cols:
+        return None
+    return pd.DataFrame(cols, index=hdr)
+
+
 def parse_screener_company(html: str) -> dict:
     """Latest-quarter YoY growth for sales and net profit, plus headline ratios."""
     soup = BeautifulSoup(html, "html.parser")
@@ -261,6 +280,7 @@ def parse_screener_company(html: str) -> dict:
                 out["pe"] = val
             elif txt.startswith("ROCE"):
                 out["roce"] = val
+    out["own"] = parse_shareholding(soup)
     sec = soup.find("section", id="quarters")
     table = sec.find("table") if sec else None
     if table is None or table.find("thead") is None:
@@ -507,7 +527,8 @@ def fetch_stock_prices(symbols: list[str], years: int = 2) -> tuple[pd.DataFrame
 def fetch_screener_company(symbol: str) -> dict:
     key = f"scr_{symbol}"
     cached, age = store.load(key)
-    if cached is not None and age < TTL_SCREENER:
+    own_fresh = store.load(f"own_{symbol}")[1] < TTL_OWN
+    if cached is not None and age < TTL_SCREENER and own_fresh:
         return cached
     last = None
     for path in (f"/company/{symbol}/consolidated/", f"/company/{symbol}/"):
@@ -517,6 +538,10 @@ def fetch_screener_company(symbol: str) -> dict:
                 continue
             r.raise_for_status()
             d = parse_screener_company(r.text)
+            own = d.pop("own", None)
+            if own is not None and len(own):
+                own = own.assign(mcap_cr=d["mcap_cr"])
+                store.save(f"own_{symbol}", own)
             if not np.isnan(d["pat_yoy"]) or not np.isnan(d["sales_yoy"]):
                 store.save(key, d)
                 return d
@@ -549,6 +574,130 @@ def screener_search(query: str) -> list[tuple[str, str]]:
         return out
     except Exception:  # noqa: BLE001
         return cached or []
+
+
+# ---------------------------------------------------------- NSDL FPI flows --
+NSDL_BASE = "https://www.fpi.nsdl.co.in/web"
+TTL_FPI = 24 * 3600            # reports come out twice a month
+TTL_OWN = 21 * 86400           # shareholding changes quarterly
+
+
+def norm_sector(name: str) -> str:
+    """'Oil, Gas & Consumable Fuels' and 'Oil Gas & Consumable Fuels' -> same key."""
+    return re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+
+def parse_fpi_selection(html: str) -> list[tuple[pd.Timestamp, str]]:
+    """Report list from FPI_Fortnightly_Selection.aspx -> [(period end, absolute URL)], newest first."""
+    out = []
+    for val, label in re.findall(r'<option[^>]*value="([^"]+)"[^>]*>([^<]+)<', html):
+        if "StaticReports" not in val:
+            continue
+        d = pd.to_datetime(label.strip().replace("JUNE", "JUN").replace("JULY", "JUL").replace("SEPT", "SEP"),
+                           errors="coerce", format="mixed")
+        if pd.isna(d):
+            continue
+        url = val.replace("~/", f"{NSDL_BASE}/") if val.startswith("~/") else val
+        out.append((d.normalize(), url))
+    return sorted(out, key=lambda x: x[0], reverse=True)
+
+
+def parse_fpi_report(html: str) -> tuple[pd.Timestamp, pd.DataFrame]:
+    """One fortnightly sector report -> (period end, DataFrame[sector, net_cr, auc_cr]) for equity, in INR crore.
+    Takes the latest 'Net Investment …' and 'AUC as on …' blocks in the report."""
+    t = pd.read_html(io.StringIO(html))[0]
+    hdr_row = next((r for r in range(min(8, len(t))) if any(str(x).strip() == "Sectors" for x in t.iloc[r])), None)
+    if hdr_row is None or hdr_row < 3:
+        raise DataError("Unexpected NSDL report layout.")
+    top, unit, grp, sub = (t.iloc[hdr_row - 3], t.iloc[hdr_row - 2], t.iloc[hdr_row - 1], t.iloc[hdr_row])
+    sec_col = next(c for c in range(t.shape[1]) if str(sub.iloc[c]).strip() == "Sectors")
+
+    def pick(prefix):
+        cols = [c for c in range(t.shape[1])
+                if str(top.iloc[c]).startswith(prefix) and "INR" in str(unit.iloc[c]).upper()
+                and str(grp.iloc[c]).strip() == "Equity" and str(sub.iloc[c]).strip() == "Equity"]
+        return (cols[-1], str(top.iloc[cols[-1]])) if cols else (None, None)
+
+    net_c, _ = pick("Net Investment")
+    auc_c, auc_label = pick("AUC as on")
+    if net_c is None or auc_c is None:
+        raise DataError("Equity columns not found in NSDL report.")
+    end = pd.to_datetime(auc_label.replace("AUC as on", "").strip(), errors="coerce", format="mixed")
+    body = t.iloc[hdr_row + 1:]
+    rows = []
+    for _, r in body.iterrows():
+        name = str(r.iloc[sec_col]).strip()
+        if not name or name.lower() in ("nan", "grand total", "total"):
+            continue
+        rows.append({"sector": name, "net_cr": _to_float(r.iloc[net_c]), "auc_cr": _to_float(r.iloc[auc_c])})
+    if not rows:
+        raise DataError("No sector rows in NSDL report.")
+    return pd.Timestamp(end).normalize(), pd.DataFrame(rows)
+
+
+def fetch_fpi_flows(n_reports: int = 12) -> tuple[pd.DataFrame, str]:
+    """Long table [date, sector, key, net_cr, auc_cr] for the latest n fortnights (cached, topped up)."""
+    key = "fpi_flows"
+    cached, age = store.load(key)
+    have = set(pd.to_datetime(cached["date"]).dt.normalize()) if cached is not None and len(cached) else set()
+    if cached is not None and age < TTL_FPI and len(have) >= n_reports:
+        return cached, "NSDL"
+    try:
+        r = net.get(f"{NSDL_BASE}/Reports/FPI_Fortnightly_Selection.aspx")
+        r.raise_for_status()
+        wanted = parse_fpi_selection(r.text)[:n_reports]
+        frames = [cached] if cached is not None and len(cached) else []
+        for d, url in wanted:
+            if d in have:
+                continue
+            rr = net.get(url)
+            rr.raise_for_status()
+            end, df = parse_fpi_report(rr.text)
+            frames.append(df.assign(date=end if not pd.isna(end) else d))
+        out = pd.concat(frames, ignore_index=True)
+        out["date"] = pd.to_datetime(out["date"]).dt.normalize()
+        out["key"] = out["sector"].map(norm_sector)
+        out = out.drop_duplicates(["date", "key"], keep="last").sort_values(["date", "sector"])
+        keep = sorted(out["date"].unique())[-max(n_reports, 24):]
+        out = out[out["date"].isin(keep)].reset_index(drop=True)
+        store.save(key, out)
+        return out, "NSDL"
+    except Exception as e:  # noqa: BLE001
+        if cached is not None and len(cached):
+            return cached, _cached_label("NSDL", age)
+        raise DataError(f"NSDL FPI data unavailable ({e}).") from e
+
+
+# ------------------------------------------------- FII / DII ownership ----
+def cached_ownership(symbols: list[str]) -> dict[str, pd.DataFrame]:
+    """Ownership tables already in the cache or seed (never downloads)."""
+    out = {}
+    for s in symbols:
+        df, _ = store.load(f"own_{s}")
+        if df is not None and len(df):
+            out[s] = df
+    return out
+
+
+def stale_ownership(symbols: list[str]) -> list[str]:
+    return [s for s in symbols if store.load(f"own_{s}")[1] > TTL_OWN]
+
+
+def refresh_ownership(symbols: list[str], budget_s: float = 170, progress=None) -> dict:
+    """Fetch Screener pages for stocks whose ownership data is missing or stale, within a time budget.
+    Stops at the first refusal from Screener."""
+    todo = stale_ownership(symbols)
+    done, t0 = 0, time.time()
+    for i, s in enumerate(todo):
+        if time.time() - t0 > budget_s:
+            break
+        d = fetch_screener_company(s)
+        if d.get("blocked"):
+            return {"done": done, "left": len(todo) - i, "blocked": d.get("error")}
+        done += 1
+        if progress:
+            progress(i + 1, len(todo), s)
+    return {"done": done, "left": max(0, len(todo) - done), "blocked": None}
 
 
 # ============================================================================

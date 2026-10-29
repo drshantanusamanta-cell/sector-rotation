@@ -36,6 +36,7 @@ MIN_GAP = {
     "www.niftyindices.com": 0.8,
     "www.nseindia.com": 1.2,
     "www.screener.in": 2.0,
+    "www.fpi.nsdl.co.in": 1.5,
 }
 DEFAULT_GAP = 0.3
 COOLDOWN_S = 15 * 60          # leave a site alone this long after 403/429

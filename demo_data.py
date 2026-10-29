@@ -33,3 +33,29 @@ def demo_bundle(keys: list[str], bench_key: str):
         pe[key] = pd.DataFrame({"pe": ix / eps, "pb": ix / eps / 6, "dy": 1.2}, index=idx)
     stocks = pd.DataFrame(stock_cols, index=idx)
     return cons, pd.DataFrame(index_px), pe, stocks
+
+
+def demo_flows(n: int = 12) -> pd.DataFrame:
+    """Synthetic NSDL-style fortnightly flows using the demo constituents' industries (tests only)."""
+    rng = np.random.default_rng(7)
+    dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=n, freq="SMS")
+    rows = []
+    for k, key in enumerate(sorted(INDEX_BY_KEY)):
+        label = INDEX_BY_KEY[key].label
+        for d in dates:
+            rows.append({"date": d, "sector": label, "net_cr": float(rng.normal(200 * (k % 5 - 2), 800)),
+                         "auc_cr": 100000.0})
+    df = pd.DataFrame(rows)
+    df["key"] = df["sector"].str.lower().str.replace(r"[^a-z0-9]+", "", regex=True)
+    return df
+
+
+def demo_ownership(symbols: list[str]) -> dict:
+    rng = np.random.default_rng(11)
+    q = ["Jun 2025", "Sep 2025", "Dec 2025", "Mar 2026", "Jun 2026", "Sep 2026"]
+    out = {}
+    for s in symbols:
+        fii = 20 + np.cumsum(rng.normal(0, 0.6, len(q)))
+        dii = 15 + np.cumsum(rng.normal(0, 0.6, len(q)))
+        out[s] = pd.DataFrame({"FII": fii, "DII": dii, "mcap_cr": float(rng.uniform(5e3, 5e5))}, index=q)
+    return out
